@@ -1,21 +1,24 @@
--- stripmine (CC:Tweaked / ATM10)
+-- stripmine (CC:Tweaked / ATM10) - FINAL
 -- Main tunnel 2-high. Every 3 blocks: side tunnels right+left, 5 long, 2-high.
--- Torch at the END of each side tunnel (placed on the wall in front).
+-- Torch at END of each side tunnel (reliable placement).
 -- Auto-refuel. If inventory full: return to start and unload to chest BEHIND start orientation.
--- If chest is full: STOP and wait (rerun after you empty chest).
--- Saves progress to disk so it can resume after interruptions.
+-- If chest is full/blocking: STOP and wait (rerun after you fix chest).
+-- Saves progress to disk and can resume; migrates older state keys.
 
-local LENGTH = tonumber(arg[1]) or 500
+-- ================= CONFIG =================
+local DEFAULT_LENGTH = 500
+local SIDE_EVERY = 3
+local SIDE_LEN   = 5
+
+local TORCH_SLOT = 16
+local FUEL_SLOT  = 15 -- optional safe slot, not unloaded
+
 local STATE_FILE = "stripmine_state"
+-- =========================================
 
-local SIDE_EVERY = 3      -- ✅ alle 3 Blöcke im Hauptgang
-local SIDE_LEN   = 5      -- ✅ Seitengang 5 lang
-local TORCH_SLOT = 16     -- ✅ Fackeln hier
-local FUEL_SLOT  = 15     -- optional: Fuel hier lagern (wird nicht entladen)
+local function log(msg) print("[StripMine] " .. msg) end
 
-local function S(msg) print("[StripMine] " .. msg) end
-
--- ---------- state ----------
+-- --------------- STATE -------------------
 local function saveState(st)
   local h = fs.open(STATE_FILE, "w")
   h.write(textutils.serialize(st))
@@ -35,7 +38,20 @@ local function resetState()
   if fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
 end
 
--- ---------- mining / move ----------
+local function migrateState(st)
+  -- Handle older versions that used 'main' instead of 'mainSteps'
+  if st.mainSteps == nil and type(st.main) == "number" then
+    st.mainSteps = st.main
+  end
+  if type(st.mainSteps) ~= "number" then st.mainSteps = 0 end
+  if st.mode == nil then st.mode = "MAIN" end
+  if st.phase == nil then st.phase = "MAIN" end
+  if st.sideDir == nil then st.sideDir = "" end
+  if type(st.sideStep) ~= "number" then st.sideStep = 0 end
+  return st
+end
+
+-- ------------- DIG / MOVE ----------------
 local function digForward()
   while turtle.detect() do
     turtle.dig()
@@ -67,57 +83,62 @@ local function step2High()
   digUp()
 end
 
--- ---------- fuel ----------
-local function tryRefuel()
-  local f = turtle.getFuelLevel()
-  if f == "unlimited" then return true end
-  if f > 0 then return true end
-
-  -- try dedicated fuel slot first
-  if turtle.getItemCount(FUEL_SLOT) > 0 then
-    turtle.select(FUEL_SLOT)
-    if turtle.refuel(0) then
-      turtle.refuel(64)
-      turtle.select(1)
-      return turtle.getFuelLevel() > 0
-    end
+-- --------------- FUEL --------------------
+local function tryRefuelFromSlot(slot)
+  if turtle.getItemCount(slot) <= 0 then return false end
+  turtle.select(slot)
+  if turtle.refuel(0) then
+    turtle.refuel(64)
+    turtle.select(1)
+    return (turtle.getFuelLevel() == "unlimited") or (turtle.getFuelLevel() > 0)
   end
-
-  -- then try everything except torches
-  for i=1,16 do
-    if i ~= TORCH_SLOT and turtle.getItemCount(i) > 0 then
-      turtle.select(i)
-      if turtle.refuel(0) then
-        turtle.refuel(64)
-        turtle.select(1)
-        return turtle.getFuelLevel() > 0
-      end
-    end
-  end
-
   turtle.select(1)
   return false
 end
 
-local function needFuel()
+local function ensureFuel()
   local f = turtle.getFuelLevel()
   if f == "unlimited" then return end
-  if f <= 0 and not tryRefuel() then
-    error("Fuel leer und kein Refuel-Material gefunden. Bitte Fuel nachlegen.")
+  if f > 0 then return end
+
+  -- prefer dedicated fuel slot
+  if tryRefuelFromSlot(FUEL_SLOT) then return end
+
+  -- then try all slots except torches
+  for i=1,16 do
+    if i ~= TORCH_SLOT and tryRefuelFromSlot(i) then return end
   end
+
+  error("Fuel leer und kein Refuel-Material gefunden. Bitte Fuel nachlegen.")
 end
 
--- ---------- torches ----------
-local function placeTorchWall()
-  -- place torch on the wall in front (reliable in 2-high tunnel)
-  if turtle.getItemCount(TORCH_SLOT) <= 0 then return false end
+-- -------------- TORCH --------------------
+local function placeTorchAtSideEnd()
+  -- Reliable method:
+  -- At end of side tunnel, you're facing a SOLID wall block.
+  -- You cannot place into a solid block. So:
+  -- 1) turn around and step 1 back
+  -- 2) turn back to the end wall
+  -- 3) place() into the air block in front (the end cell), attached to the wall
+  -- 4) turn around again to continue returning
+  if turtle.getItemCount(TORCH_SLOT) <= 0 then
+    log("Keine Fackeln in Slot " .. TORCH_SLOT .. "!")
+    return false
+  end
+
+  turtle.turnLeft(); turtle.turnLeft() -- face back toward exit
+  forward()                             -- step 1 back from the end wall
+  turtle.turnLeft(); turtle.turnLeft() -- face end wall again
+
   turtle.select(TORCH_SLOT)
   local ok = turtle.place()
   turtle.select(1)
+
+  turtle.turnLeft(); turtle.turnLeft() -- face back to exit
   return ok
 end
 
--- ---------- inventory ----------
+-- ----------- INVENTORY -------------------
 local function compactInventory()
   for i=1,16 do
     if turtle.getItemCount(i) > 0 then
@@ -142,10 +163,11 @@ local function isInventoryFull()
 end
 
 local function unloadToBackChestOrStop(st)
-  -- At start, facing forward. Chest is behind start orientation.
-  S("Entladen in Kiste hinter Start...")
+  -- At start facing forward, chest is behind start orientation.
+  -- Turn around and drop forward into the chest.
+  log("Entladen in Kiste hinter Start...")
 
-  turtle.turnLeft(); turtle.turnLeft() -- face the chest direction
+  turtle.turnLeft(); turtle.turnLeft()
 
   local failed = false
   for i=1,16 do
@@ -159,7 +181,7 @@ local function unloadToBackChestOrStop(st)
   end
 
   turtle.select(1)
-  turtle.turnLeft(); turtle.turnLeft() -- face forward again
+  turtle.turnLeft(); turtle.turnLeft()
 
   if failed then
     st.mode = "WAIT_CHEST_FULL"
@@ -171,7 +193,7 @@ end
 local function goHome(stepsFromStart)
   turtle.turnLeft(); turtle.turnLeft()
   for i=1,stepsFromStart do
-    needFuel()
+    ensureFuel()
     forward()
   end
   turtle.turnLeft(); turtle.turnLeft()
@@ -179,68 +201,89 @@ end
 
 local function goBackToWork(stepsFromStart)
   for i=1,stepsFromStart do
-    needFuel()
+    ensureFuel()
     step2High()
   end
 end
 
--- ---------- side tunnels ----------
+-- ----------- SIDE TUNNEL -----------------
 local function sideTunnel(dir, st) -- dir: "R" or "L"
   if dir == "R" then turtle.turnRight() else turtle.turnLeft() end
 
+  -- dig in
   for i=1,SIDE_LEN do
-    needFuel()
+    ensureFuel()
     step2High()
     st.sideStep = i
     saveState(st)
   end
 
-  -- Torch at END of side tunnel
-  placeTorchWall()
+  -- torch at end (reliable)
+  st.phase = "TORCH"
+  saveState(st)
+  placeTorchAtSideEnd()
 
-  -- return out
-  turtle.turnLeft(); turtle.turnLeft()
-  for i=1,SIDE_LEN do
-    needFuel()
+  -- Now we are facing back toward the exit and already moved 1 step back.
+  -- Return remaining (SIDE_LEN - 1) steps to the main tunnel.
+  st.phase = "RETURN"
+  saveState(st)
+
+  for i=1,(SIDE_LEN - 1) do
+    ensureFuel()
     forward()
   end
-  turtle.turnLeft(); turtle.turnLeft()
 
-  -- face main again
+  -- face main direction again
   if dir == "R" then turtle.turnLeft() else turtle.turnRight() end
+
+  st.sideStep = 0
+  saveState(st)
 end
 
--- ---------- main ----------
-local function run()
-  if arg[1] == "reset" or arg[2] == "reset" then
+-- --------------- MAIN --------------------
+local function parseLengthArg()
+  -- supports: stripmine 500
+  -- supports: stripmine reset
+  if arg and (arg[1] == "reset" or arg[2] == "reset") then
     resetState()
-    S("State reset.")
-    return
+    log("State reset.")
+    return nil, "reset_done"
   end
 
-  local st = loadState() or { mode="MAIN", mainSteps=0, phase="MAIN", sideStep=0, sideDir="" }
+  local n = nil
+  if arg and arg[1] then n = tonumber(arg[1]) end
+  if not n then n = DEFAULT_LENGTH end
+  return n, nil
+end
 
-  -- If previously stopped because chest full, retry unloading now
+local function run()
+  local length, special = parseLengthArg()
+  if special == "reset_done" then return end
+
+  local st = loadState()
+  st = migrateState(st or { mode="MAIN", mainSteps=0, phase="MAIN", sideDir="", sideStep=0 })
+
+  -- If chest was full, try unloading again first
   if st.mode == "WAIT_CHEST_FULL" then
-    S("WAIT_CHEST_FULL aktiv -> versuche erneut zu entladen...")
+    log("WAIT_CHEST_FULL aktiv -> versuche erneut zu entladen...")
     unloadToBackChestOrStop(st)
     st.mode = "MAIN"
     saveState(st)
-    S("Entladen ok. Fahre zurück zur Arbeitsposition...")
+    log("Entladen ok. Fahre zurück zur Arbeitsposition...")
     goBackToWork(st.mainSteps)
   end
 
-  S("Start/Resume bei mainSteps=" .. st.mainSteps)
+  log("Start/Resume bei mainSteps=" .. st.mainSteps .. " / target=" .. length)
 
-  while st.mainSteps < LENGTH do
-    needFuel()
+  while st.mainSteps < length do
+    ensureFuel()
 
-    -- unload only if inventory is full
+    -- unload only if FULL
     if isInventoryFull() then
       st.mode = "UNLOADING"
       saveState(st)
 
-      S("Inventar voll -> Heimweg")
+      log("Inventar voll -> Heimweg")
       goHome(st.mainSteps)
 
       unloadToBackChestOrStop(st)
@@ -248,20 +291,22 @@ local function run()
       st.mode = "MAIN"
       saveState(st)
 
-      S("Zurück zur Arbeit")
+      log("Zurück zur Arbeit")
       goBackToWork(st.mainSteps)
     end
 
     -- main step
     st.phase = "MAIN"
+    st.sideDir = ""
+    st.sideStep = 0
     saveState(st)
 
     step2High()
     st.mainSteps = st.mainSteps + 1
     saveState(st)
 
-    -- sides every 3 blocks of main tunnel
-    if st.mainSteps % SIDE_EVERY == 0 then
+    -- side tunnels every 3 blocks of main tunnel
+    if (st.mainSteps % SIDE_EVERY) == 0 then
       st.phase = "SIDES"
       saveState(st)
 
@@ -279,10 +324,10 @@ local function run()
 
   st.mode = "DONE"
   saveState(st)
-  S("Fertig.")
+  log("Fertig.")
 end
 
 local ok, err = pcall(run)
 if not ok then
-  S("STOP: " .. tostring(err))
+  log("STOP: " .. tostring(err))
 end
