@@ -1,0 +1,134 @@
+-- stripmine (CC:Tweaked / ATM10)
+local L=tonumber(arg[1]) or 500
+local F="stripmine_state"
+local SE=2
+local SL=5
+local TS=16
+local FS=15
+
+local function S(m) print("[StripMine] "..m) end
+local function save(t) local h=fs.open(F,"w") h.write(textutils.serialize(t)) h.close() end
+local function load() if not fs.exists(F) then return nil end local h=fs.open(F,"r") local t=textutils.unserialize(h.readAll()) h.close() return t end
+
+local function dig()
+  while turtle.detect() do turtle.dig() sleep(0.05) end
+end
+local function digU()
+  while turtle.detectUp() do turtle.digUp() sleep(0.05) end
+end
+local function fwd()
+  dig()
+  while not turtle.forward() do turtle.attack() sleep(0.05) dig() end
+end
+local function step2()
+  dig(); digU(); fwd(); digU()
+end
+
+local function refuel()
+  if turtle.getFuelLevel()=="unlimited" then return true end
+  if turtle.getFuelLevel()>0 then return true end
+  for i=1,16 do
+    if i~=TS and turtle.getItemCount(i)>0 then
+      turtle.select(i)
+      if turtle.refuel(0) then turtle.refuel(64) turtle.select(1) return turtle.getFuelLevel()>0 end
+    end
+  end
+  turtle.select(1); return false
+end
+local function needFuel()
+  if turtle.getFuelLevel()=="unlimited" then return end
+  if turtle.getFuelLevel()<=0 and not refuel() then error("Fuel leer, bitte nachlegen.") end
+end
+
+local function compact()
+  for i=1,16 do
+    if turtle.getItemCount(i)>0 then
+      turtle.select(i)
+      for j=i+1,16 do
+        if turtle.getItemCount(j)>0 then turtle.select(j); turtle.transferTo(i) end
+      end
+    end
+  end
+  turtle.select(1)
+end
+local function full()
+  compact()
+  for i=1,16 do if turtle.getItemCount(i)==0 then return false end end
+  return true
+end
+
+local function torchEnd()
+  if turtle.getItemCount(TS)>0 then turtle.select(TS); turtle.placeDown(); turtle.select(1) end
+end
+
+local function unloadOrStop(st)
+  S("Entladen in Kiste hinter Start...")
+  turtle.turnLeft(); turtle.turnLeft()
+  local fail=false
+  for i=1,16 do
+    if turtle.getItemCount(i)>0 and i~=TS and i~=FS then
+      turtle.select(i)
+      local ok=turtle.drop()
+      if (not ok) and turtle.getItemCount(i)>0 then fail=true end
+    end
+  end
+  turtle.select(1)
+  turtle.turnLeft(); turtle.turnLeft()
+  if fail then st.mode="WAIT_CHEST_FULL"; save(st); error("Kiste voll/blockiert. Ich bleibe stehen.") end
+end
+
+local function goHome(n)
+  turtle.turnLeft(); turtle.turnLeft()
+  for i=1,n do needFuel(); fwd() end
+  turtle.turnLeft(); turtle.turnLeft()
+end
+
+local function goBack(n)
+  for i=1,n do needFuel(); step2() end
+end
+
+local function side(dir,st)
+  if dir=="R" then turtle.turnRight() else turtle.turnLeft() end
+  for i=1,SL do needFuel(); step2(); st.side=i; save(st) end
+  torchEnd()
+  turtle.turnLeft(); turtle.turnLeft()
+  for i=1,SL do needFuel(); fwd() end
+  turtle.turnLeft(); turtle.turnLeft()
+  if dir=="R" then turtle.turnLeft() else turtle.turnRight() end
+end
+
+local st=load() or {mode="MAIN",main=0,phase="MAIN",side=0}
+if st.mode=="WAIT_CHEST_FULL" then
+  S("Warte-Modus war aktiv, versuche erneut zu entladen...")
+  unloadOrStop(st)
+  st.mode="MAIN"; save(st)
+  goBack(st.main)
+end
+
+S("Start/Resume bei main="..st.main)
+
+while st.main < L do
+  needFuel()
+
+  if full() then
+    st.mode="UNLOAD"; save(st)
+    goHome(st.main)
+    unloadOrStop(st)
+    st.mode="MAIN"; save(st)
+    goBack(st.main)
+  end
+
+  st.phase="MAIN"; save(st)
+  step2()
+  st.main=st.main+1; save(st)
+
+  if st.main % SE == 0 then
+    st.phase="SIDES"; save(st)
+    st.side=0; save(st); side("R",st)
+    st.side=0; save(st); side("L",st)
+    st.phase="MAIN"; save(st)
+  end
+end
+
+st.mode="DONE"; save(st)
+S("Fertig.")
