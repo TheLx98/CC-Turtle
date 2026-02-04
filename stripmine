@@ -1,26 +1,16 @@
--- stripmine (CC:Tweaked / ATM10) - FINAL (post-sides checks only)
--- 2-high main tunnel. Every 3 blocks: side tunnels right+left, 5 long, 2-high.
--- Torch attempt at end of each side (ignore placement failure).
--- NO auto-refuel.
--- NEW: Only after finishing BOTH side tunnels, check:
---      - inventory full -> go home, unload, return
---      - torches <= 2   -> go home, unload, STOP (wait for refill)
--- Resume-safe side stages (prevents double-right).
-
--- ================= CONFIG =================
+-- stripmine - FAST CHECKS, NO STACKING, STABLE TORCH PRECHECK
 local DEFAULT_LENGTH = 500
 local SIDE_EVERY = 3
 local SIDE_LEN   = 5
 
 local TORCH_SLOT = 16
-local TORCH_MIN  = 2   -- must be >2 to continue; <=2 triggers go home + unload + stop
+local TORCH_MIN  = 2
 
 local STATE_FILE = "stripmine_state"
--- =========================================
 
 local function log(msg) print("[StripMine] " .. msg) end
 
--- --------------- STATE -------------------
+-- state
 local function saveState(st)
   local h = fs.open(STATE_FILE, "w")
   h.write(textutils.serialize(st))
@@ -32,8 +22,7 @@ local function loadState()
   local h = fs.open(STATE_FILE, "r")
   local t = textutils.unserialize(h.readAll())
   h.close()
-  if type(t) ~= "table" then return nil end
-  return t
+  return type(t) == "table" and t or nil
 end
 
 local function resetState()
@@ -46,23 +35,17 @@ local function migrateState(st)
   if st.mode == nil then st.mode = "MAIN" end
   if st.phase == nil then st.phase = "MAIN" end
   if type(st.sideStep) ~= "number" then st.sideStep = 0 end
-  if st.sideStage == nil then st.sideStage = "" end -- "" / "R" / "L"
+  if st.sideStage == nil then st.sideStage = "" end
   return st
 end
 
--- ------------- DIG / MOVE ----------------
+-- dig/move
 local function digForward()
-  while turtle.detect() do
-    turtle.dig()
-    sleep(0.05)
-  end
+  while turtle.detect() do turtle.dig(); sleep(0.05) end
 end
 
 local function digUp()
-  while turtle.detectUp() do
-    turtle.digUp()
-    sleep(0.05)
-  end
+  while turtle.detectUp() do turtle.digUp(); sleep(0.05) end
 end
 
 local function forward()
@@ -75,22 +58,17 @@ local function forward()
 end
 
 local function step2High()
-  digForward()
-  digUp()
-  forward()
-  digUp()
+  digForward(); digUp(); forward(); digUp()
 end
 
--- --------------- FUEL --------------------
+-- fuel (no auto refuel)
 local function ensureFuel()
   local f = turtle.getFuelLevel()
   if f == "unlimited" then return end
-  if f <= 0 then
-    error("Fuel ist leer. Ich stoppe. (Kein Auto-Refuel aktiv)")
-  end
+  if f <= 0 then error("Fuel ist leer. Ich stoppe. (Kein Auto-Refuel)") end
 end
 
--- ----------- INVENTORY -------------------
+-- fast checks
 local function isInventoryFullFast()
   for i=1,16 do
     if turtle.getItemCount(i) == 0 then return false end
@@ -98,70 +76,75 @@ local function isInventoryFullFast()
   return true
 end
 
--- ---------- HOME MOVE (main line) --------
+local function torchesEnough()
+  return turtle.getItemCount(TORCH_SLOT) > TORCH_MIN
+end
+
+-- home/back (assumes main line facing forward)
 local function goHome(stepsFromStart)
-  -- assumes turtle is on main line facing forward direction
   turtle.turnLeft(); turtle.turnLeft()
-  for i=1,stepsFromStart do
-    ensureFuel()
-    forward()
-  end
+  for i=1,stepsFromStart do ensureFuel(); forward() end
   turtle.turnLeft(); turtle.turnLeft()
 end
 
 local function goBackToWork(stepsFromStart)
-  for i=1,stepsFromStart do
-    ensureFuel()
-    step2High()
-  end
+  for i=1,stepsFromStart do ensureFuel(); step2High() end
 end
 
--- ---------- UNLOAD (chest behind start) ---
+-- unload (chest behind start)
 local function unloadToBackChestOrStop(st)
   log("Entladen in Kiste hinter Start...")
-
-  turtle.turnLeft(); turtle.turnLeft() -- face chest behind start
+  turtle.turnLeft(); turtle.turnLeft()
 
   local failed = false
   for i=1,16 do
     if turtle.getItemCount(i) > 0 and i ~= TORCH_SLOT then
       turtle.select(i)
       local ok = turtle.drop()
-      if (not ok) and turtle.getItemCount(i) > 0 then
-        failed = true
-      end
+      if (not ok) and turtle.getItemCount(i) > 0 then failed = true end
     end
   end
-
   turtle.select(1)
-  turtle.turnLeft(); turtle.turnLeft() -- face forward again
+  turtle.turnLeft(); turtle.turnLeft()
 
   if failed then
     st.mode = "WAIT_CHEST_FULL"
     saveState(st)
-    error("Kiste voll/blockiert: Entladen nicht vollständig. Ich bleibe am Start stehen.")
+    error("Kiste voll/blockiert: Entladen nicht vollständig. Stop am Start.")
   end
 end
 
--- -------------- TORCH --------------------
+local function goHomeUnloadReturn(st)
+  st.mode = "UNLOADING"; saveState(st)
+  goHome(st.mainSteps)
+  unloadToBackChestOrStop(st)
+  st.mode = "MAIN"; st.phase = "MAIN"; saveState(st)
+  goBackToWork(st.mainSteps)
+end
+
+local function goHomeUnloadStopTorches(st)
+  st.mode = "WAIT_TORCHES"; st.phase = "WAIT_TORCHES"; st.sideStage = ""; st.sideStep = 0
+  saveState(st)
+  goHome(st.mainSteps)
+  unloadToBackChestOrStop(st)
+  st.mode = "WAIT_TORCHES"; st.phase = "WAIT_TORCHES"; saveState(st)
+  error("Fackeln <= " .. TORCH_MIN .. " in Slot 16. Bitte auffüllen und neu starten.")
+end
+
+-- torch attempt end of side (ignore fail)
 local function tryPlaceTorchAtSideEndIgnoreFail()
   if turtle.getItemCount(TORCH_SLOT) <= 0 then return false end
-
-  -- Try "wall torch": turn around, step 1 back, face end direction, place(); ignore failure.
   turtle.turnLeft(); turtle.turnLeft()
   forward()
   turtle.turnLeft(); turtle.turnLeft()
-
   turtle.select(TORCH_SLOT)
   local ok = turtle.place()
   turtle.select(1)
-
-  turtle.turnLeft(); turtle.turnLeft() -- face back to exit again
+  turtle.turnLeft(); turtle.turnLeft()
   return ok
 end
 
--- ----------- SIDE TUNNEL -----------------
-local function sideTunnel(dir, st) -- dir: "R" or "L"
+local function sideTunnel(dir, st)
   if dir == "R" then turtle.turnRight() else turtle.turnLeft() end
 
   for i=1,SIDE_LEN do
@@ -171,73 +154,24 @@ local function sideTunnel(dir, st) -- dir: "R" or "L"
     saveState(st)
   end
 
-  st.phase = "SIDES_TORCH"
-  saveState(st)
+  st.phase = "SIDES_TORCH"; saveState(st)
   tryPlaceTorchAtSideEndIgnoreFail()
 
-  st.phase = "SIDES_RETURN"
-  saveState(st)
-  for i=1,(SIDE_LEN - 1) do
-    ensureFuel()
-    forward()
-  end
+  st.phase = "SIDES_RETURN"; saveState(st)
+  for i=1,(SIDE_LEN - 1) do ensureFuel(); forward() end
 
-  -- face main forward again
   if dir == "R" then turtle.turnRight() else turtle.turnLeft() end
-
   st.sideStep = 0
   saveState(st)
 end
 
--- --------- POST-SIDES CHECKS -------------
-local function afterSidesChecks(st)
-  -- Check inventory full AFTER both sides
-  if isInventoryFullFast() then
-    st.mode = "UNLOADING"
-    st.phase = "POST_SIDES_UNLOAD"
-    saveState(st)
-
-    log("Nach Seitengängen: Inventar voll -> Heimweg")
-    goHome(st.mainSteps)
-
-    unloadToBackChestOrStop(st)
-
-    st.mode = "MAIN"
-    st.phase = "MAIN"
-    saveState(st)
-
-    log("Zurück zur Arbeit")
-    goBackToWork(st.mainSteps)
-  end
-
-  -- Check torches AFTER both sides
-  local tc = turtle.getItemCount(TORCH_SLOT)
-  if tc <= TORCH_MIN then
-    st.mode = "WAIT_TORCHES"
-    st.phase = "POST_SIDES_TORCH_STOP"
-    saveState(st)
-
-    log("Nach Seitengängen: Fackeln niedrig (" .. tc .. "). Heimweg, entladen, STOP.")
-    goHome(st.mainSteps)
-    unloadToBackChestOrStop(st)
-
-    st.mode = "WAIT_TORCHES"
-    st.phase = "WAIT_TORCHES"
-    saveState(st)
-
-    error("Fackeln <= " .. TORCH_MIN .. " in Slot 16. Bitte auffüllen und neu starten.")
-  end
-end
-
--- --------------- MAIN --------------------
 local function parseLengthArg()
   if arg and (arg[1] == "reset" or arg[2] == "reset") then
     resetState()
     log("State reset.")
     return nil, "reset_done"
   end
-  local n = nil
-  if arg and arg[1] then n = tonumber(arg[1]) end
+  local n = (arg and arg[1]) and tonumber(arg[1]) or nil
   if not n then n = DEFAULT_LENGTH end
   return n, nil
 end
@@ -248,26 +182,20 @@ local function run()
 
   local st = migrateState(loadState() or { mode="MAIN", mainSteps=0, phase="MAIN", sideStep=0, sideStage="" })
 
-  -- Resume handling: chest full
+  -- resume: chest full
   if st.mode == "WAIT_CHEST_FULL" then
-    log("WAIT_CHEST_FULL aktiv -> versuche erneut zu entladen...")
     unloadToBackChestOrStop(st)
-    st.mode = "MAIN"; st.phase = "MAIN"
-    saveState(st)
-    log("Entladen ok. Fahre zurück zur Arbeitsposition...")
+    st.mode = "MAIN"; st.phase = "MAIN"; saveState(st)
     goBackToWork(st.mainSteps)
   end
 
-  -- Resume handling: waiting torches
+  -- resume: torches
   if st.mode == "WAIT_TORCHES" then
-    local tc = turtle.getItemCount(TORCH_SLOT)
-    if tc <= TORCH_MIN then
-      error("STOP: Fackeln noch zu niedrig (" .. tc .. "). Bitte Slot 16 auffüllen und erneut starten.")
+    if not torchesEnough() then
+      error("STOP: Fackeln noch zu niedrig. Bitte Slot 16 auffüllen.")
     end
-    log("Fackeln wieder ausreichend (" .. tc .. ") -> entlade zur Sicherheit und fahre zurück...")
     unloadToBackChestOrStop(st)
-    st.mode = "MAIN"; st.phase = "MAIN"
-    saveState(st)
+    st.mode = "MAIN"; st.phase = "MAIN"; saveState(st)
     goBackToWork(st.mainSteps)
   end
 
@@ -276,35 +204,40 @@ local function run()
   while st.mainSteps < length do
     ensureFuel()
 
-    -- SIDE BRANCH POINT
+    -- ✅ Fast inventory check (cheap) after each main step cycle
+    if isInventoryFullFast() then
+      log("Inventar voll -> Heim/Entladen")
+      goHomeUnloadReturn(st)
+    end
+
+    -- side point
     if (st.mainSteps > 0) and (st.mainSteps % SIDE_EVERY == 0) then
+      -- ✅ torch precheck to prevent "fly out of mountain"
+      if not torchesEnough() then
+        log("Fackeln niedrig vor Seitengängen -> Heim/Entladen/STOP")
+        goHomeUnloadStopTorches(st)
+      end
+
       st.phase = "SIDES"
       if st.sideStage == "" then st.sideStage = "R" end
       saveState(st)
 
       if st.sideStage == "R" then
-        st.sideStep = 0; saveState(st)
         sideTunnel("R", st)
-        st.sideStage = "L"; saveState(st)
+        st.sideStage = "L"
+        saveState(st)
       end
 
       if st.sideStage == "L" then
-        st.sideStep = 0; saveState(st)
         sideTunnel("L", st)
         st.sideStage = ""
         st.phase = "MAIN"
         saveState(st)
       end
-
-      -- ✅ YOUR REQUEST: checks happen AFTER both side tunnels
-      afterSidesChecks(st)
     end
 
     -- main forward step
-    st.mode = "MAIN"
-    st.phase = "MAIN"
-    st.sideStage = ""
-    st.sideStep = 0
+    st.mode = "MAIN"; st.phase = "MAIN"; st.sideStage = ""; st.sideStep = 0
     saveState(st)
 
     step2High()
@@ -318,6 +251,4 @@ local function run()
 end
 
 local ok, err = pcall(run)
-if not ok then
-  log("STOP: " .. tostring(err))
-end
+if not ok then log("STOP: " .. tostring(err)) end
