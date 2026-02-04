@@ -1,10 +1,10 @@
--- stripmine (CC:Tweaked / ATM10) - FINAL (no auto-refuel)
--- Main tunnel 2-high. Every 3 blocks: side tunnels right+left, 5 long, 2-high.
--- Torch attempt at END of each side tunnel (IGNORE placement failure).
--- NO auto-refuel: if fuel is 0 -> STOP immediately.
--- If inventory full: return to start and unload to chest BEHIND start orientation.
--- If chest is full/blocking: STOP and wait.
--- If torches (slot 16) are EMPTY: go start, unload, STOP and wait. Resume after refill.
+-- stripmine (CC:Tweaked / ATM10) - FINAL (post-sides checks only)
+-- 2-high main tunnel. Every 3 blocks: side tunnels right+left, 5 long, 2-high.
+-- Torch attempt at end of each side (ignore placement failure).
+-- NO auto-refuel.
+-- NEW: Only after finishing BOTH side tunnels, check:
+--      - inventory full -> go home, unload, return
+--      - torches <= 2   -> go home, unload, STOP (wait for refill)
 -- Resume-safe side stages (prevents double-right).
 
 -- ================= CONFIG =================
@@ -13,6 +13,8 @@ local SIDE_EVERY = 3
 local SIDE_LEN   = 5
 
 local TORCH_SLOT = 16
+local TORCH_MIN  = 2   -- must be >2 to continue; <=2 triggers go home + unload + stop
+
 local STATE_FILE = "stripmine_state"
 -- =========================================
 
@@ -39,16 +41,12 @@ local function resetState()
 end
 
 local function migrateState(st)
-  -- older versions used 'main'
   if st.mainSteps == nil and type(st.main) == "number" then st.mainSteps = st.main end
   if type(st.mainSteps) ~= "number" then st.mainSteps = 0 end
-
   if st.mode == nil then st.mode = "MAIN" end
   if st.phase == nil then st.phase = "MAIN" end
-
   if type(st.sideStep) ~= "number" then st.sideStep = 0 end
   if st.sideStage == nil then st.sideStage = "" end -- "" / "R" / "L"
-
   return st
 end
 
@@ -93,23 +91,7 @@ local function ensureFuel()
 end
 
 -- ----------- INVENTORY -------------------
-local function compactInventory()
-  for i=1,16 do
-    if turtle.getItemCount(i) > 0 then
-      turtle.select(i)
-      for j=i+1,16 do
-        if turtle.getItemCount(j) > 0 then
-          turtle.select(j)
-          turtle.transferTo(i)
-        end
-      end
-    end
-  end
-  turtle.select(1)
-end
-
-local function isInventoryFull()
-  compactInventory()
+local function isInventoryFullFast()
   for i=1,16 do
     if turtle.getItemCount(i) == 0 then return false end
   end
@@ -138,8 +120,7 @@ end
 local function unloadToBackChestOrStop(st)
   log("Entladen in Kiste hinter Start...")
 
-  -- chest is behind start orientation => turn around and drop forward into it
-  turtle.turnLeft(); turtle.turnLeft()
+  turtle.turnLeft(); turtle.turnLeft() -- face chest behind start
 
   local failed = false
   for i=1,16 do
@@ -153,7 +134,7 @@ local function unloadToBackChestOrStop(st)
   end
 
   turtle.select(1)
-  turtle.turnLeft(); turtle.turnLeft()
+  turtle.turnLeft(); turtle.turnLeft() -- face forward again
 
   if failed then
     st.mode = "WAIT_CHEST_FULL"
@@ -162,33 +143,11 @@ local function unloadToBackChestOrStop(st)
   end
 end
 
--- --------- TORCH HANDLER (pragmatic) -----
-local function ensureTorchesOrStopAtSafePoint(st)
-  -- Only call this when we're CERTAIN we're on the main line facing forward.
-  if turtle.getItemCount(TORCH_SLOT) > 0 then return end
-
-  st.mode = "WAIT_TORCHES"
-  st.phase = "WAIT_TORCHES"
-  st.sideStage = ""
-  st.sideStep = 0
-  saveState(st)
-
-  log("Keine Fackeln mehr (Slot 16 leer). Fahre zum Start, entlade, stoppe.")
-  goHome(st.mainSteps)
-  unloadToBackChestOrStop(st)
-
-  st.mode = "WAIT_TORCHES"
-  st.phase = "WAIT_TORCHES"
-  saveState(st)
-
-  error("Keine Fackeln mehr. Bitte Slot 16 auffüllen und Script neu starten.")
-end
-
+-- -------------- TORCH --------------------
 local function tryPlaceTorchAtSideEndIgnoreFail()
   if turtle.getItemCount(TORCH_SLOT) <= 0 then return false end
 
-  -- At end: might be wall, might be open cave. We try a wall placement method:
-  -- turn around, step 1 back, face end direction, place(). If it fails, we ignore.
+  -- Try "wall torch": turn around, step 1 back, face end direction, place(); ignore failure.
   turtle.turnLeft(); turtle.turnLeft()
   forward()
   turtle.turnLeft(); turtle.turnLeft()
@@ -203,7 +162,6 @@ end
 
 -- ----------- SIDE TUNNEL -----------------
 local function sideTunnel(dir, st) -- dir: "R" or "L"
-  -- enter side
   if dir == "R" then turtle.turnRight() else turtle.turnLeft() end
 
   for i=1,SIDE_LEN do
@@ -213,12 +171,10 @@ local function sideTunnel(dir, st) -- dir: "R" or "L"
     saveState(st)
   end
 
-  -- torch attempt at end (ignore failure)
   st.phase = "SIDES_TORCH"
   saveState(st)
   tryPlaceTorchAtSideEndIgnoreFail()
 
-  -- now facing back, already moved 1 back; return remaining
   st.phase = "SIDES_RETURN"
   saveState(st)
   for i=1,(SIDE_LEN - 1) do
@@ -231,6 +187,46 @@ local function sideTunnel(dir, st) -- dir: "R" or "L"
 
   st.sideStep = 0
   saveState(st)
+end
+
+-- --------- POST-SIDES CHECKS -------------
+local function afterSidesChecks(st)
+  -- Check inventory full AFTER both sides
+  if isInventoryFullFast() then
+    st.mode = "UNLOADING"
+    st.phase = "POST_SIDES_UNLOAD"
+    saveState(st)
+
+    log("Nach Seitengängen: Inventar voll -> Heimweg")
+    goHome(st.mainSteps)
+
+    unloadToBackChestOrStop(st)
+
+    st.mode = "MAIN"
+    st.phase = "MAIN"
+    saveState(st)
+
+    log("Zurück zur Arbeit")
+    goBackToWork(st.mainSteps)
+  end
+
+  -- Check torches AFTER both sides
+  local tc = turtle.getItemCount(TORCH_SLOT)
+  if tc <= TORCH_MIN then
+    st.mode = "WAIT_TORCHES"
+    st.phase = "POST_SIDES_TORCH_STOP"
+    saveState(st)
+
+    log("Nach Seitengängen: Fackeln niedrig (" .. tc .. "). Heimweg, entladen, STOP.")
+    goHome(st.mainSteps)
+    unloadToBackChestOrStop(st)
+
+    st.mode = "WAIT_TORCHES"
+    st.phase = "WAIT_TORCHES"
+    saveState(st)
+
+    error("Fackeln <= " .. TORCH_MIN .. " in Slot 16. Bitte auffüllen und neu starten.")
+  end
 end
 
 -- --------------- MAIN --------------------
@@ -252,7 +248,7 @@ local function run()
 
   local st = migrateState(loadState() or { mode="MAIN", mainSteps=0, phase="MAIN", sideStep=0, sideStage="" })
 
-  -- If chest was full, retry unloading first
+  -- Resume handling: chest full
   if st.mode == "WAIT_CHEST_FULL" then
     log("WAIT_CHEST_FULL aktiv -> versuche erneut zu entladen...")
     unloadToBackChestOrStop(st)
@@ -262,12 +258,13 @@ local function run()
     goBackToWork(st.mainSteps)
   end
 
-  -- If waiting for torches: only continue if torches exist now
+  -- Resume handling: waiting torches
   if st.mode == "WAIT_TORCHES" then
-    if turtle.getItemCount(TORCH_SLOT) <= 0 then
-      error("STOP: Immer noch keine Fackeln in Slot 16. Bitte auffüllen und erneut starten.")
+    local tc = turtle.getItemCount(TORCH_SLOT)
+    if tc <= TORCH_MIN then
+      error("STOP: Fackeln noch zu niedrig (" .. tc .. "). Bitte Slot 16 auffüllen und erneut starten.")
     end
-    log("Fackeln wieder vorhanden -> entlade zur Sicherheit und fahre zurück zur Arbeitsposition...")
+    log("Fackeln wieder ausreichend (" .. tc .. ") -> entlade zur Sicherheit und fahre zurück...")
     unloadToBackChestOrStop(st)
     st.mode = "MAIN"; st.phase = "MAIN"
     saveState(st)
@@ -279,48 +276,28 @@ local function run()
   while st.mainSteps < length do
     ensureFuel()
 
-    -- unload only if full
-    if isInventoryFull() then
-      st.mode = "UNLOADING"
-      saveState(st)
-
-      log("Inventar voll -> Heimweg")
-      goHome(st.mainSteps)
-
-      unloadToBackChestOrStop(st)
-
-      st.mode = "MAIN"; st.phase = "MAIN"
-      saveState(st)
-
-      log("Zurück zur Arbeit")
-      goBackToWork(st.mainSteps)
-    end
-
-    -- SIDE BRANCH POINT: handle sides BEFORE moving further
+    -- SIDE BRANCH POINT
     if (st.mainSteps > 0) and (st.mainSteps % SIDE_EVERY == 0) then
-      -- Torch empty check ONLY at safe point (main line, facing forward).
-      ensureTorchesOrStopAtSafePoint(st)
-
       st.phase = "SIDES"
       if st.sideStage == "" then st.sideStage = "R" end
       saveState(st)
 
       if st.sideStage == "R" then
-        st.sideStep = 0
-        saveState(st)
+        st.sideStep = 0; saveState(st)
         sideTunnel("R", st)
-        st.sideStage = "L"
-        saveState(st)
+        st.sideStage = "L"; saveState(st)
       end
 
       if st.sideStage == "L" then
-        st.sideStep = 0
-        saveState(st)
+        st.sideStep = 0; saveState(st)
         sideTunnel("L", st)
         st.sideStage = ""
         st.phase = "MAIN"
         saveState(st)
       end
+
+      -- ✅ YOUR REQUEST: checks happen AFTER both side tunnels
+      afterSidesChecks(st)
     end
 
     -- main forward step
